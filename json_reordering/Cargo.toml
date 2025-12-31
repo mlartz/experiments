@@ -10,3 +10,8 @@ zstd = "0.13"
 rand = "0.8"
 indexmap = { version = "2.0", features = ["serde"] }
 clap = { version = "4.0", features = ["derive"] }
+rayon = "1.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
