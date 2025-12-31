@@ -17,8 +17,29 @@ use std::path::Path;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Input zstd-compressed JSONL files
-    #[arg(required = true)]
     files: Vec<String>,
+
+    /// File containing a list of input files (one per line)
+    #[arg(short = 'f', long = "file-list")]
+    file_list: Option<String>,
+}
+
+/// Read file paths from a file list (one path per line)
+fn read_file_list(path: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut files = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        // Skip empty lines and comments
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            files.push(trimmed.to_string());
+        }
+    }
+
+    Ok(files)
 }
 
 /// Recursively sort all keys in a JSON value alphabetically.
@@ -235,6 +256,27 @@ fn process_file(input_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn main() {
     let args = Args::parse();
 
+    // Collect all input files from command line args and file list
+    let mut all_files: Vec<String> = args.files.clone();
+
+    if let Some(ref file_list_path) = args.file_list {
+        match read_file_list(file_list_path) {
+            Ok(files) => {
+                println!("Read {} files from {}", files.len(), file_list_path);
+                all_files.extend(files);
+            }
+            Err(e) => {
+                eprintln!("Error reading file list {}: {}", file_list_path, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if all_files.is_empty() {
+        eprintln!("Error: No input files provided. Use positional arguments or --file-list.");
+        std::process::exit(1);
+    }
+
     println!();
     println!("═══════════════════════════════════════════════════════════════════════════════");
     println!("          JSON Key Reordering - Testing Impact on ZSTD Compression            ");
@@ -244,7 +286,7 @@ fn main() {
     let mut success_count = 0;
     let mut error_count = 0;
 
-    for file in &args.files {
+    for file in &all_files {
         match process_file(file) {
             Ok(()) => success_count += 1,
             Err(e) => {
