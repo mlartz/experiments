@@ -1,0 +1,12 @@
+[package]
+name = "json_reordering"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+zstd = "0.13"
+rand = "0.8"
+indexmap = { version = "2.0", features = ["serde"] }
+clap = { version = "4.0", features = ["derive"] }
