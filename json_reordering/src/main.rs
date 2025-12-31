@@ -2,10 +2,12 @@ use clap::Parser;
 use indexmap::IndexMap;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use rayon::prelude::*;
 use serde_json::{Map, Value};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// CLI tool to test JSON key ordering impact on zstd compression.
 ///
@@ -22,10 +24,14 @@ struct Args {
     /// File containing a list of input files (one per line)
     #[arg(short = 'f', long = "file-list")]
     file_list: Option<String>,
+
+    /// Number of parallel jobs (default: number of CPU cores)
+    #[arg(short = 'j', long = "jobs")]
+    jobs: Option<usize>,
 }
 
 /// Read file paths from a file list (one path per line)
-fn read_file_list(path: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn read_file_list(path: &str) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut files = Vec::new();
@@ -50,10 +56,10 @@ fn sort_keys_recursive(value: &Value) -> Value {
         Value::Object(map) => {
             // Collect keys and sort them
             let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
+            keys.sort_unstable();
 
             // Build new map with sorted keys
-            let mut sorted_map = Map::new();
+            let mut sorted_map = Map::with_capacity(map.len());
             for key in keys {
                 let sorted_value = sort_keys_recursive(map.get(key).unwrap());
                 sorted_map.insert(key.clone(), sorted_value);
@@ -72,6 +78,7 @@ fn sort_keys_recursive(value: &Value) -> Value {
 /// Recursively randomize all keys in a JSON value.
 /// For objects, shuffles keys and recurses into nested values.
 /// For arrays, recurses into each element.
+/// Uses a deterministic seed based on object index for reproducibility.
 fn randomize_keys_recursive(value: &Value, rng: &mut impl rand::Rng) -> Value {
     match value {
         Value::Object(map) => {
@@ -80,7 +87,7 @@ fn randomize_keys_recursive(value: &Value, rng: &mut impl rand::Rng) -> Value {
             keys.shuffle(rng);
 
             // Build new IndexMap with shuffled keys (preserves insertion order)
-            let mut shuffled: IndexMap<String, Value> = IndexMap::new();
+            let mut shuffled: IndexMap<String, Value> = IndexMap::with_capacity(map.len());
             for key in keys {
                 let randomized_value = randomize_keys_recursive(map.get(key).unwrap(), rng);
                 shuffled.insert(key.clone(), randomized_value);
@@ -107,50 +114,51 @@ fn preserve_keys_recursive(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             // Use IndexMap to preserve original insertion order
-            let preserved: IndexMap<String, Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), preserve_keys_recursive(v)))
-                .collect();
+            let mut preserved: IndexMap<String, Value> = IndexMap::with_capacity(map.len());
+            for (k, v) in map.iter() {
+                preserved.insert(k.clone(), preserve_keys_recursive(v));
+            }
             serde_json::to_value(preserved).unwrap()
         }
-        Value::Array(arr) => {
-            Value::Array(arr.iter().map(preserve_keys_recursive).collect())
-        }
+        Value::Array(arr) => Value::Array(arr.iter().map(preserve_keys_recursive).collect()),
         _ => value.clone(),
     }
 }
 
 /// Read and decompress a zstd-compressed file
-fn read_zstd_file(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn read_zstd_file(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(path)?;
     let decoder = zstd::stream::Decoder::new(file)?;
-    let mut reader = BufReader::new(decoder);
+    let mut reader = BufReader::with_capacity(256 * 1024, decoder);
     let mut contents = Vec::new();
     std::io::Read::read_to_end(&mut reader, &mut contents)?;
     Ok(contents)
 }
 
-/// Parse JSONL data into a vector of JSON values
-fn parse_jsonl(data: &[u8]) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
-    let reader = BufReader::new(data);
-    let mut values = Vec::new();
+/// Parse JSONL data into a vector of JSON values (parallel)
+fn parse_jsonl_parallel(data: &[u8]) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    // Split into lines first
+    let lines: Vec<&[u8]> = data
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty() && !line.iter().all(|&b| b == b' ' || b == b'\t'))
+        .collect();
 
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(trimmed)?;
-        values.push(value);
-    }
+    // Parse lines in parallel
+    let values: Result<Vec<Value>, _> = lines
+        .par_iter()
+        .map(|line| {
+            serde_json::from_slice(line)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        })
+        .collect();
 
-    Ok(values)
+    values
 }
 
-/// Write JSON values to JSONL format
+/// Write JSON values to JSONL format with pre-allocated buffer
 fn write_jsonl(values: &[Value]) -> Vec<u8> {
-    let mut buffer = Vec::new();
+    // Estimate size: average ~500 bytes per object
+    let mut buffer = Vec::with_capacity(values.len() * 500);
     for value in values {
         serde_json::to_writer(&mut buffer, value).unwrap();
         buffer.push(b'\n');
@@ -163,12 +171,15 @@ fn compress_zstd(data: &[u8]) -> Vec<u8> {
     zstd::encode_all(data.as_ref(), 3).unwrap()
 }
 
-/// Write compressed data to a file
-fn write_zstd_file(path: &Path, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+/// Write compressed data to a file with buffered writer
+fn write_zstd_file(path: &Path, data: &[u8]) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let compressed = compress_zstd(data);
-    let mut file = File::create(path)?;
-    file.write_all(&compressed)?;
-    Ok(())
+    let compressed_len = compressed.len() as u64;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, file);
+    writer.write_all(&compressed)?;
+    writer.flush()?;
+    Ok(compressed_len)
 }
 
 /// Generate output filename by stripping .zst extension and adding suffix
@@ -186,75 +197,96 @@ fn generate_output_path(input_path: &Path, suffix: &str) -> std::path::PathBuf {
     parent.join(format!("{}_{}.jsonl.zst", base_name, suffix))
 }
 
-/// Process a single input file
-fn process_file(input_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let path = Path::new(input_path);
+/// Result of processing a single file
+struct ProcessResult {
+    input_path: String,
+    object_count: usize,
+    input_size: u64,
+    original_size: u64,
+    sorted_size: u64,
+    random_size: u64,
+    original_path: std::path::PathBuf,
+    sorted_path: std::path::PathBuf,
+    random_path: std::path::PathBuf,
+}
 
-    println!("Processing: {}", input_path);
+/// Process a single input file with internal parallelization
+fn process_file(input_path: &str) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
+    let path = Path::new(input_path);
 
     // Read and decompress input
     let data = read_zstd_file(path)?;
     let original_compressed_size = std::fs::metadata(path)?.len();
 
-    // Parse JSONL
-    let values = parse_jsonl(&data)?;
-    println!("  Parsed {} JSON objects", values.len());
-
-    // Create three variants
-    let original_values: Vec<Value> = values.iter().map(preserve_keys_recursive).collect();
-    let sorted_values: Vec<Value> = values.iter().map(sort_keys_recursive).collect();
-
-    // Use a seeded RNG for reproducibility
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    let random_values: Vec<Value> = values
-        .iter()
-        .map(|v| randomize_keys_recursive(v, &mut rng))
-        .collect();
-
-    // Convert to JSONL
-    let original_jsonl = write_jsonl(&original_values);
-    let sorted_jsonl = write_jsonl(&sorted_values);
-    let random_jsonl = write_jsonl(&random_values);
+    // Parse JSONL in parallel
+    let values = parse_jsonl_parallel(&data)?;
+    let object_count = values.len();
 
     // Generate output paths
     let original_path = generate_output_path(path, "original");
     let sorted_path = generate_output_path(path, "sorted");
     let random_path = generate_output_path(path, "random");
 
-    // Write compressed output files
-    write_zstd_file(&original_path, &original_jsonl)?;
-    write_zstd_file(&sorted_path, &sorted_jsonl)?;
-    write_zstd_file(&random_path, &random_jsonl)?;
+    // Process all three variants in parallel
+    let (original_size, (sorted_size, random_size)) = rayon::join(
+        || {
+            // Original: preserve key ordering (parallel over objects)
+            let original_values: Vec<Value> =
+                values.par_iter().map(preserve_keys_recursive).collect();
+            let original_jsonl = write_jsonl(&original_values);
+            write_zstd_file(&original_path, &original_jsonl).unwrap()
+        },
+        || {
+            rayon::join(
+                || {
+                    // Sorted: sort keys alphabetically (parallel over objects)
+                    let sorted_values: Vec<Value> =
+                        values.par_iter().map(sort_keys_recursive).collect();
+                    let sorted_jsonl = write_jsonl(&sorted_values);
+                    write_zstd_file(&sorted_path, &sorted_jsonl).unwrap()
+                },
+                || {
+                    // Random: randomize keys with deterministic per-object seeds
+                    // Use parallel iterator with index-based seeding for reproducibility
+                    let random_values: Vec<Value> = values
+                        .par_iter()
+                        .enumerate()
+                        .map(|(idx, v)| {
+                            // Seed RNG based on index for deterministic parallel results
+                            let mut rng = rand::rngs::StdRng::seed_from_u64(42 + idx as u64);
+                            randomize_keys_recursive(v, &mut rng)
+                        })
+                        .collect();
+                    let random_jsonl = write_jsonl(&random_values);
+                    write_zstd_file(&random_path, &random_jsonl).unwrap()
+                },
+            )
+        },
+    );
 
-    // Report sizes
-    let original_size = std::fs::metadata(&original_path)?.len();
-    let sorted_size = std::fs::metadata(&sorted_path)?.len();
-    let random_size = std::fs::metadata(&random_path)?.len();
-
-    println!("  Input compressed size:    {:>10} bytes", original_compressed_size);
-    println!("  Output sizes:");
-    println!("    Original ordering:      {:>10} bytes -> {}", original_size, original_path.display());
-    println!("    Sorted keys:            {:>10} bytes -> {}", sorted_size, sorted_path.display());
-    println!("    Randomized keys:        {:>10} bytes -> {}", random_size, random_path.display());
-
-    // Calculate and show differences
-    let sorted_diff = sorted_size as i64 - original_size as i64;
-    let random_diff = random_size as i64 - original_size as i64;
-
-    println!("  Size differences vs original:");
-    println!("    Sorted:     {:>+10} bytes ({:+.2}%)",
-             sorted_diff,
-             (sorted_diff as f64 / original_size as f64) * 100.0);
-    println!("    Randomized: {:>+10} bytes ({:+.2}%)",
-             random_diff,
-             (random_diff as f64 / original_size as f64) * 100.0);
-    println!();
-
-    Ok(())
+    Ok(ProcessResult {
+        input_path: input_path.to_string(),
+        object_count,
+        input_size: original_compressed_size,
+        original_size,
+        sorted_size,
+        random_size,
+        original_path,
+        sorted_path,
+        random_path,
+    })
 }
 
 fn main() {
     let args = Args::parse();
+
+    // Configure thread pool if --jobs specified
+    if let Some(jobs) = args.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build_global()
+            .expect("Failed to configure thread pool");
+    }
 
     // Collect all input files from command line args and file list
     let mut all_files: Vec<String> = args.files.clone();
@@ -277,31 +309,91 @@ fn main() {
         std::process::exit(1);
     }
 
+    let num_threads = rayon::current_num_threads();
     println!();
     println!("═══════════════════════════════════════════════════════════════════════════════");
     println!("          JSON Key Reordering - Testing Impact on ZSTD Compression            ");
     println!("═══════════════════════════════════════════════════════════════════════════════");
     println!();
+    println!("Processing {} files with {} threads", all_files.len(), num_threads);
+    println!();
 
-    let mut success_count = 0;
-    let mut error_count = 0;
+    let success_count = AtomicUsize::new(0);
+    let error_count = AtomicUsize::new(0);
 
-    for file in &all_files {
-        match process_file(file) {
-            Ok(()) => success_count += 1,
-            Err(e) => {
-                eprintln!("Error processing {}: {}", file, e);
-                error_count += 1;
+    // Process files in parallel
+    let results: Vec<_> = all_files
+        .par_iter()
+        .map(|file| {
+            let result = process_file(file);
+            match &result {
+                Ok(_) => {
+                    success_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    eprintln!("Error processing {}: {}", file, e);
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-        }
+            result
+        })
+        .collect();
+
+    // Print results sequentially for clean output
+    println!("───────────────────────────────────────────────────────────────────────────────");
+    for result in results.into_iter().flatten() {
+        println!("File: {}", result.input_path);
+        println!("  Parsed {} JSON objects", result.object_count);
+        println!(
+            "  Input compressed size:    {:>10} bytes",
+            result.input_size
+        );
+        println!("  Output sizes:");
+        println!(
+            "    Original ordering:      {:>10} bytes -> {}",
+            result.original_size,
+            result.original_path.display()
+        );
+        println!(
+            "    Sorted keys:            {:>10} bytes -> {}",
+            result.sorted_size,
+            result.sorted_path.display()
+        );
+        println!(
+            "    Randomized keys:        {:>10} bytes -> {}",
+            result.random_size,
+            result.random_path.display()
+        );
+
+        let sorted_diff = result.sorted_size as i64 - result.original_size as i64;
+        let random_diff = result.random_size as i64 - result.original_size as i64;
+
+        println!("  Size differences vs original:");
+        println!(
+            "    Sorted:     {:>+10} bytes ({:+.2}%)",
+            sorted_diff,
+            (sorted_diff as f64 / result.original_size as f64) * 100.0
+        );
+        println!(
+            "    Randomized: {:>+10} bytes ({:+.2}%)",
+            random_diff,
+            (random_diff as f64 / result.original_size as f64) * 100.0
+        );
+        println!();
     }
 
+    let final_success = success_count.load(Ordering::Relaxed);
+    let final_errors = error_count.load(Ordering::Relaxed);
+
     println!("═══════════════════════════════════════════════════════════════════════════════");
-    println!("  Summary: {} files processed successfully, {} errors", success_count, error_count);
+    println!(
+        "  Summary: {} files processed successfully, {} errors",
+        final_success, final_errors
+    );
     println!("═══════════════════════════════════════════════════════════════════════════════");
     println!();
 
-    if error_count > 0 {
+    if final_errors > 0 {
         std::process::exit(1);
     }
 }
