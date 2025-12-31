@@ -212,7 +212,7 @@ fn main() {
     println!("Compression: zstd level 3 (default)");
     println!();
 
-    let test_sizes = [1, 10, 100, 1000, 10000];
+    let test_sizes = [1, 10, 100, 1000, 10000, 100000];
     let seed = 42u64;
 
     for &size in &test_sizes {
