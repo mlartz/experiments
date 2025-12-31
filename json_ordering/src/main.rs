@@ -4,25 +4,28 @@ use rand::{Rng, SeedableRng};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
+/// Default key ordering as defined in the schema
+const DEFAULT_KEY_ORDER: [&str; 15] = [
+    "account_id",
+    "timestamp",
+    "user_email",
+    "transaction_type",
+    "amount_cents",
+    "currency_code",
+    "merchant_name",
+    "merchant_category",
+    "card_last_four",
+    "authorization_code",
+    "is_international",
+    "processing_fee",
+    "status",
+    "ip_address",
+    "user_agent",
+];
+
 /// Generate a JSON object with 15 keys and random values
 fn generate_json_object(rng: &mut impl Rng) -> BTreeMap<String, Value> {
-    let keys = [
-        "account_id",
-        "timestamp",
-        "user_email",
-        "transaction_type",
-        "amount_cents",
-        "currency_code",
-        "merchant_name",
-        "merchant_category",
-        "card_last_four",
-        "authorization_code",
-        "is_international",
-        "processing_fee",
-        "status",
-        "ip_address",
-        "user_agent",
-    ];
+    let keys = DEFAULT_KEY_ORDER;
 
     let mut obj = BTreeMap::new();
 
@@ -102,6 +105,17 @@ fn to_sorted_json(obj: &BTreeMap<String, Value>) -> Value {
     Value::Object(map)
 }
 
+/// Convert BTreeMap to serde_json Value with default key order (as defined in schema)
+fn to_default_json(obj: &BTreeMap<String, Value>) -> Value {
+    let mut map = IndexMap::new();
+    for key in DEFAULT_KEY_ORDER {
+        if let Some(value) = obj.get(key) {
+            map.insert(key.to_string(), value.clone());
+        }
+    }
+    serde_json::to_value(map).unwrap()
+}
+
 /// Convert BTreeMap to serde_json Value with randomized key order
 fn to_random_json(obj: &BTreeMap<String, Value>, rng: &mut impl Rng) -> Value {
     let mut keys: Vec<_> = obj.keys().cloned().collect();
@@ -140,6 +154,9 @@ fn run_benchmark(num_objects: usize, seed: u64) {
     let base_objects: Vec<BTreeMap<String, Value>> =
         (0..num_objects).map(|_| generate_json_object(&mut rng)).collect();
 
+    // Create default version (keys in original schema order)
+    let default_objects: Vec<Value> = base_objects.iter().map(|obj| to_default_json(obj)).collect();
+
     // Create sorted version (keys alphabetically sorted)
     let sorted_objects: Vec<Value> = base_objects.iter().map(|obj| to_sorted_json(obj)).collect();
 
@@ -151,63 +168,59 @@ fn run_benchmark(num_objects: usize, seed: u64) {
         .collect();
 
     // Write to JSONL
+    let default_jsonl = write_jsonl(&default_objects);
     let sorted_jsonl = write_jsonl(&sorted_objects);
     let random_jsonl = write_jsonl(&random_objects);
 
     // Compress with zstd
+    let default_compressed = compress_zstd(&default_jsonl);
     let sorted_compressed = compress_zstd(&sorted_jsonl);
     let random_compressed = compress_zstd(&random_jsonl);
 
     // Calculate compression ratios
+    let default_ratio = default_jsonl.len() as f64 / default_compressed.len() as f64;
     let sorted_ratio = sorted_jsonl.len() as f64 / sorted_compressed.len() as f64;
     let random_ratio = random_jsonl.len() as f64 / random_compressed.len() as f64;
 
-    // Calculate the advantage of sorted over random
-    let size_diff_uncompressed =
-        random_jsonl.len() as i64 - sorted_jsonl.len() as i64;
-    let size_diff_compressed =
-        random_compressed.len() as i64 - sorted_compressed.len() as i64;
-    let pct_diff_compressed = if sorted_compressed.len() > 0 {
-        (size_diff_compressed as f64 / sorted_compressed.len() as f64) * 100.0
-    } else {
-        0.0
-    };
+    // Calculate size differences (random vs sorted)
+    let diff_random_vs_sorted = random_compressed.len() as i64 - sorted_compressed.len() as i64;
 
-    println!("┌─────────────────────────────────────────────────────────────────────────────┐");
+    println!("┌────────────────────────────────────────────────────────────────────────────────────────────┐");
     println!(
-        "│ Benchmark: {:>6} objects                                                    │",
+        "│ Benchmark: {:>6} objects                                                                   │",
         num_objects
     );
-    println!("├─────────────────────────────────────────────────────────────────────────────┤");
-    println!("│                        │    Sorted Keys    │   Random Keys    │    Diff    │");
-    println!("├────────────────────────┼───────────────────┼──────────────────┼────────────┤");
+    println!("├────────────────────────────────────────────────────────────────────────────────────────────┤");
+    println!("│                        │  Default Keys   │  Sorted Keys   │  Random Keys   │ Rnd vs Srt  │");
+    println!("├────────────────────────┼─────────────────┼────────────────┼────────────────┼─────────────┤");
     println!(
-        "│ Uncompressed (bytes)   │ {:>15} │ {:>14}  │ {:>+9} │",
+        "│ Uncompressed (bytes)   │ {:>13} │ {:>12}  │ {:>12}  │             │",
+        default_jsonl.len(),
         sorted_jsonl.len(),
-        random_jsonl.len(),
-        size_diff_uncompressed
+        random_jsonl.len()
     );
     println!(
-        "│ Compressed (bytes)     │ {:>15} │ {:>14}  │ {:>+9} │",
+        "│ Compressed (bytes)     │ {:>13} │ {:>12}  │ {:>12}  │ {:>+10}  │",
+        default_compressed.len(),
         sorted_compressed.len(),
         random_compressed.len(),
-        size_diff_compressed
+        diff_random_vs_sorted
     );
     println!(
-        "│ Compression ratio      │ {:>15.2}x │ {:>14.2}x │ {:>+9.1}% │",
-        sorted_ratio, random_ratio, pct_diff_compressed
+        "│ Compression ratio      │ {:>13.2}x │ {:>12.2}x │ {:>12.2}x │             │",
+        default_ratio, sorted_ratio, random_ratio
     );
-    println!("└─────────────────────────────────────────────────────────────────────────────┘");
+    println!("└────────────────────────────────────────────────────────────────────────────────────────────┘");
     println!();
 }
 
 fn main() {
     println!();
-    println!("═══════════════════════════════════════════════════════════════════════════════");
-    println!("        JSON Key Ordering Impact on ZSTD Compression - Benchmark Results       ");
-    println!("═══════════════════════════════════════════════════════════════════════════════");
+    println!("════════════════════════════════════════════════════════════════════════════════════════════");
+    println!("              JSON Key Ordering Impact on ZSTD Compression - Benchmark Results              ");
+    println!("════════════════════════════════════════════════════════════════════════════════════════════");
     println!();
-    println!("Testing JSONL files with sorted vs randomized key ordering.");
+    println!("Testing JSONL files with default, sorted, and randomized key ordering.");
     println!("Each JSON object has 15 keys with realistic transaction data.");
     println!("Compression: zstd level 3 (default)");
     println!();
@@ -219,17 +232,16 @@ fn main() {
         run_benchmark(size, seed);
     }
 
-    println!("═══════════════════════════════════════════════════════════════════════════════");
-    println!("                                   Summary                                      ");
-    println!("═══════════════════════════════════════════════════════════════════════════════");
+    println!("════════════════════════════════════════════════════════════════════════════════════════════");
+    println!("                                         Summary                                            ");
+    println!("════════════════════════════════════════════════════════════════════════════════════════════");
     println!();
-    println!("Key findings:");
-    println!("  - Sorted keys: Keys appear in alphabetical order in every JSON object");
-    println!("  - Random keys: Keys appear in different random order per object");
-    println!("  - Positive diff: Random ordering uses MORE bytes than sorted");
-    println!("  - Negative diff: Random ordering uses FEWER bytes than sorted");
+    println!("Key orderings tested:");
+    println!("  - Default keys: Keys in original schema order (consistent across all objects)");
+    println!("  - Sorted keys:  Keys in alphabetical order (consistent across all objects)");
+    println!("  - Random keys:  Keys in different random order per object (inconsistent)");
     println!();
     println!("The compression ratio difference demonstrates how consistent key ordering");
-    println!("allows zstd's dictionary-based compression to find more repeated patterns.");
+    println!("(whether default or sorted) allows zstd to find more repeated patterns.");
     println!();
 }
